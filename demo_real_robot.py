@@ -1,160 +1,191 @@
-"""
-Usage:
-(robodiff)$ python demo_real_robot.py -o <demo_save_dir> --robot_ip <ip_of_ur5>
-
-Robot movement:
-Move your SpaceMouse to move the robot EEF (locked in xy plane).
-Press SpaceMouse right button to unlock z axis.
-Press SpaceMouse left button to enable rotation axes.
-
-Recording control:
-Click the opencv window (make sure it's in focus).
-Press "C" to start recording.
-Press "S" to stop recording.
-Press "Q" to exit program.
-Press "Backspace" to delete the previously recorded episode.
-"""
-
-# %%
 import time
 from multiprocessing.managers import SharedMemoryManager
 import click
 import cv2
 import numpy as np
-import scipy.spatial.transform as st
+import scipy.spatial.transform as trans
+
 from diffusion_policy.real_world.real_env import RealEnv
-from diffusion_policy.real_world.spacemouse_shared_memory import Spacemouse
 from diffusion_policy.common.precise_sleep import precise_wait
 from diffusion_policy.real_world.keystroke_counter import (
     KeystrokeCounter, Key, KeyCode
 )
+HOME_POSE6 = np.array([-0.09111701 ,-0.72375263 , 0.06410842, -0.14472972, 2.22072607, -2.04910124], dtype=np.float64)
+# Keyboard controls:
+#   q : quit program
+#   c : start recording a new episode
+#   p : stop recording and save episode
+#   x : discard current episode (do not save)
+#   w/s/a/d/r/f : translate TCP (+x/-x/+y/-y/+z/-z)
+#   i/k/j/l/u/o : rotate TCP (rx/ry/rz)
+#   t : toggle gripper open/close
+#   h : go to HOME pose (target pose override)
+#   g : print current TCP pose
+# ---------------- keyboard teleop ----------------
+def get_keyboard_delta_from_events(press_events, key_counter, pos_step, rot_step):
+    boost = 2.0 if key_counter[Key.shift] else 1.0
 
+    dpos = np.zeros(3, dtype=np.float32)
+    drot_xyz = np.zeros(3, dtype=np.float32)
+
+    for ev in press_events:
+        # translation
+        if ev == KeyCode(char='w'): dpos[0] += 1
+        elif ev == KeyCode(char='s'): dpos[0] -= 1
+        elif ev == KeyCode(char='d'): dpos[1] += 1
+        elif ev == KeyCode(char='a'): dpos[1] -= 1
+        elif ev == KeyCode(char='r'): dpos[2] += 1
+        elif ev == KeyCode(char='f'): dpos[2] -= 1
+
+        # rotation
+        elif ev == KeyCode(char='i'): drot_xyz[0] += 1
+        elif ev == KeyCode(char='k'): drot_xyz[0] -= 1
+        elif ev == KeyCode(char='l'): drot_xyz[1] += 1
+        elif ev == KeyCode(char='j'): drot_xyz[1] -= 1
+        elif ev == KeyCode(char='u'): drot_xyz[2] += 1
+        elif ev == KeyCode(char='o'): drot_xyz[2] -= 1
+
+    dpos *= pos_step * boost
+    drot_xyz *= rot_step * boost
+    return dpos, drot_xyz
+
+# ---------------- CLI ----------------
 @click.command()
 @click.option('--output', '-o', required=True, help="Directory to save demonstration dataset.")
-@click.option('--robot_ip', '-ri', required=True, help="UR5's IP address e.g. 192.168.0.204")
-@click.option('--vis_camera_idx', default=0, type=int, help="Which RealSense camera to visualize.")
-@click.option('--init_joints', '-j', is_flag=True, default=False, help="Whether to initialize robot joint configuration in the beginning.")
-@click.option('--frequency', '-f', default=10, type=float, help="Control frequency in Hz.")
-@click.option('--command_latency', '-cl', default=0.01, type=float, help="Latency between receiving SapceMouse command to executing on Robot in Sec.")
-def main(output, robot_ip, vis_camera_idx, init_joints, frequency, command_latency):
-    dt = 1/frequency
+@click.option('--robot_ip', '-ri', required=True, help="UR5 IP address, e.g. 192.168.0.204")
+@click.option('--init_joints', '-j', is_flag=True, default=False)
+@click.option('--frequency', '-f', default=10.0, type=float)
+@click.option('--command_latency', '-cl', default=0.01, type=float)
+def main(output, robot_ip, init_joints, frequency, command_latency):
+    dt = 1.0 / frequency
+    open_state = 0  # start open
+    goto_home = False
     with SharedMemoryManager() as shm_manager:
         with KeystrokeCounter() as key_counter, \
-            Spacemouse(shm_manager=shm_manager) as sm, \
-            RealEnv(
-                output_dir=output, 
-                robot_ip=robot_ip, 
-                # recording resolution
-                obs_image_resolution=(1280,720),
-                frequency=frequency,
-                init_joints=init_joints,
-                enable_multi_cam_vis=True,
-                record_raw_video=True,
-                # number of threads per camera view for video recording (H.264)
-                thread_per_video=3,
-                # video recording quality, lower is better (but slower).
-                video_crf=21,
-                shm_manager=shm_manager
-            ) as env:
+             RealEnv(
+                 output_dir=output,
+                 robot_ip=robot_ip,
+                 obs_image_resolution=(1280, 720),
+                 frequency=frequency,
+                 n_obs_steps=1,
+                 usb_cam_id=0
+             ) as env:
+
             cv2.setNumThreads(1)
-
-            # realsense exposure
-            env.realsense.set_exposure(exposure=120, gain=0)
-            # realsense white balance
-            env.realsense.set_white_balance(white_balance=5900)
-
             time.sleep(1.0)
-            print('Ready!')
+            print("Ready!")
+
             state = env.get_robot_state()
-            target_pose = state['TargetTCPPose']
+            target_pose = np.zeros(7, dtype=np.float64)
+            target_pose[:6] = np.array(state["TargetTCPPose"], dtype=np.float64)
+            target_pose[6] = 0.0
             t_start = time.monotonic()
             iter_idx = 0
             stop = False
             is_recording = False
+
             while not stop:
-                # calculate timing
+                # timing
                 t_cycle_end = t_start + (iter_idx + 1) * dt
                 t_sample = t_cycle_end - command_latency
-                t_command_target = t_cycle_end + dt
 
-                # pump obs
+                # get obs
                 obs = env.get_obs()
 
-                # handle key presses
                 press_events = key_counter.get_press_events()
-                for key_stroke in press_events:
-                    if key_stroke == KeyCode(char='q'):
-                        # Exit program
+                # handle open/close gripper toggle
+
+                # 更新 target_pose 位姿...
+                target_pose[6] = float(open_state)
+                # handle key events
+                for ev in press_events:
+                    if ev == KeyCode(char='q'):
                         stop = True
-                    elif key_stroke == KeyCode(char='c'):
-                        # Start recording
-                        env.start_episode(t_start + (iter_idx + 2) * dt - time.monotonic() + time.time())
+                    elif ev == KeyCode(char='c'):
+                        env.start_episode(
+                            t_start + (iter_idx + 2) * dt
+                            - time.monotonic() + time.time()
+                        )
                         key_counter.clear()
                         is_recording = True
-                        print('Recording!')
-                    elif key_stroke == KeyCode(char='s'):
-                        # Stop recording
+                        print("Recording!")
+                    elif ev == KeyCode(char='p'):
                         env.end_episode()
                         key_counter.clear()
                         is_recording = False
-                        print('Stopped.')
-                    elif key_stroke == Key.backspace:
-                        # Delete the most recent recorded episode
-                        if click.confirm('Are you sure to drop an episode?'):
-                            env.drop_episode()
-                            key_counter.clear()
-                            is_recording = False
-                        # delete
-                stage = key_counter[Key.space]
+                        print("Stopped.")
+                    elif ev == KeyCode(char='x') and is_recording:
+                        env.discard_episode("discard_by_key_x")
+                        key_counter.clear()
+                        is_recording = False
+                        print("Discarded current episode.")
+                    elif ev == KeyCode(char='t'):
+                        open_state = 1 - open_state
+                        target_pose[6] = float(open_state)
+                        print(f"[GRIP] toggled by t -> open_state={open_state}")
+                    elif ev == KeyCode(char='g'):
+                        robot_state = env.get_robot_state()
+                        q = np.asarray(robot_state.get("ActualTCPPose", []), dtype=np.float64)
+                        print("Current TCP pose:", q)
+                    elif ev == KeyCode(char='h'):
+                        goto_home = True
 
-                # visualize
-                vis_img = obs[f'camera_{vis_camera_idx}'][-1,:,:,::-1].copy()
-                episode_id = env.replay_buffer.n_episodes
-                text = f'Episode: {episode_id}, Stage: {stage}'
-                if is_recording:
-                    text += ', Recording!'
-                cv2.putText(
+                # visualize (USB cam is always camera_0)
+                scale = 6
+                vis_img = obs["camera_0"][-1, :, :, ::-1].copy()
+                vis_img_big = cv2.resize(
                     vis_img,
-                    text,
-                    (10,30),
-                    fontFace=cv2.FONT_HERSHEY_SIMPLEX,
-                    fontScale=1,
-                    thickness=2,
-                    color=(255,255,255)
+                    (84 * scale, 84 * scale),
+                    interpolation=cv2.INTER_NEAREST  # UI 用最近邻最清晰
                 )
-
-                cv2.imshow('default', vis_img)
+                text = f""
+                if is_recording:
+                    text += " | Recording"
+                cv2.putText(
+                    vis_img_big, text, (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0,
+                    (255, 255, 255), 2
+                )
+                cv2.imshow("teleop", vis_img_big)
                 cv2.pollKey()
 
                 precise_wait(t_sample)
-                # get teleop command
-                sm_state = sm.get_motion_state_transformed()
-                # print(sm_state)
-                dpos = sm_state[:3] * (env.max_pos_speed / frequency)
-                drot_xyz = sm_state[3:] * (env.max_rot_speed / frequency)
-                
-                if not sm.is_button_pressed(0):
-                    # translation mode
-                    drot_xyz[:] = 0
+
+                # teleop
+                pos_step = 0.002   # 2mm per press
+                rot_step = 0.035   # ~2deg per press (0.035 rad)
+                if goto_home:
+                    target_pose[:6] = HOME_POSE6.copy()
+                    goto_home = False
                 else:
-                    dpos[:] = 0
-                if not sm.is_button_pressed(1):
-                    # 2D translation mode
-                    dpos[2] = 0    
+                    dpos, drot_xyz = get_keyboard_delta_from_events(
+                        press_events, key_counter, pos_step, rot_step
+                    )
 
-                drot = st.Rotation.from_euler('xyz', drot_xyz)
-                target_pose[:3] += dpos
-                target_pose[3:] = (drot * st.Rotation.from_rotvec(
-                    target_pose[3:])).as_rotvec()
+                    drot = trans.Rotation.from_euler("xyz", drot_xyz)
+                    target_pose[:3] += dpos
+                    target_pose[3:6] = (
+                        drot * trans.Rotation.from_rotvec(target_pose[3:6])
+                    ).as_rotvec()
+                # send command
+                # env.exec_actions(
+                #     actions=[target_pose.copy()],
+                #     timestamps=[t_command_target - time.monotonic() + time.time()],
+                #     stages=[stage],
+                # )
+                now_wall = time.time()
+                lead = max(2.0 * dt, 0.05)   # >= 2 control cycles or 50ms
+                ts_cmd = now_wall + lead
 
-                # execute teleop command
                 env.exec_actions(
-                    actions=[target_pose], 
-                    timestamps=[t_command_target-time.monotonic()+time.time()],
-                    stages=[stage])
+                    obs = obs,
+                    actions=[target_pose.copy()],
+                    timestamps=[ts_cmd],
+                )
+
                 precise_wait(t_cycle_end)
                 iter_idx += 1
 
-# %%
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
