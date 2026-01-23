@@ -30,17 +30,33 @@ class _USBCamera:
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
         self.cap.set(cv2.CAP_PROP_FPS, self.fps)
+        try:
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            print("[WARN] Failed to set CAP_PROP_BUFFERSIZE")
 
     def read_rgb(self) -> np.ndarray:
-        ok, frame_bgr = self.cap.read()
+        # 尽量清空缓冲：限时 + 限次，避免极端情况卡住
+        t0 = time.time()
+        n = 0
+        while (time.time() - t0) < 0.01:
+            self.cap.grab()
+            n += 1
+
+        ok, frame_bgr = self.cap.retrieve()
+
+        # 兜底：retrieve失败时，尝试直接read一次
+        if (not ok) or (frame_bgr is None):
+            ok, frame_bgr = self.cap.read()
+
         w, h = self.resolution
         if (not ok) or (frame_bgr is None):
             return np.zeros((h, w, 3), dtype=np.uint8)
 
         if frame_bgr.shape[1] != w or frame_bgr.shape[0] != h:
             frame_bgr = cv2.resize(frame_bgr, (w, h), interpolation=cv2.INTER_AREA)
-        frame_rgb = frame_bgr[..., ::-1].copy()  # BGR -> RGB
-        return frame_rgb
+
+        return frame_bgr[..., ::-1].copy()
 
     def close(self):
         try:
@@ -81,7 +97,7 @@ class RealEnv:
         # shared memory (kept; not required here)
         shm_manager: Optional[SharedMemoryManager] = None,
         # usb cam
-        usb_cam_id: int = 0,
+        usb_cam_id: int = 2,
     ):
         self.output_dir = pathlib.Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -108,7 +124,7 @@ class RealEnv:
         self._buf_robot: List[Dict[str, Any]] = []
         self._buf_actions: List[np.ndarray] = []
         self._buf_timestamps: List[float] = []
-        self._buf_robot_eef_pose = []
+        self._buf_robot_eef_rot = []
         self._buf_open_state = []
         if shm_manager is None:
             shm_manager = SharedMemoryManager()
@@ -118,13 +134,11 @@ class RealEnv:
         self.robot = RTDEInterpolationController(
             robot_ip=self.robot_ip,
             shm_manager=self.shm_manager,
-            frequency=self.frequency,
-
         )
         self.camera = _USBCamera(
             cam_id=self.usb_cam_id,
             resolution=self.obs_image_resolution,
-            fps=self.frequency,
+            fps=30,
         )
         self._last_grip = 0
 
@@ -194,8 +208,23 @@ class RealEnv:
             # 真正的语义约束
             assert v.shape == (6,), f"{dst_k} shape {v.shape}, expected (6,)"
             out[dst_k] = v.astype(np.float32 if self.obs_float32 else None)
-        return out
+            if "robot_eef_pose" in out:
+                pose6 = out["robot_eef_pose"]  # (6,)
+                out["robot_eef_rot"] = pose6[3:6].astype(np.float32, copy=True)
 
+        return out
+    # def get_vis_obs(self) -> Dict[str, Any]:
+    #     """
+    #     Return:
+    #       - camera_0: (H, W, 3) uint8 RGB
+    #     """
+    #     # camera
+    #     img = self.camera.read_rgb()  # 原始分辨率
+    #     raw_img = img.copy()
+    #     raw_imgs = raw_img[None, ...]  # (1, H, W, 3)
+    #     raw_imgs = {"raw_camera_0": raw_imgs}
+    #     return raw_imgs
+    
     def get_obs(self) -> Dict[str, Any]:
         """
         Return:
@@ -204,12 +233,12 @@ class RealEnv:
         """
         # camera
         img = self.camera.read_rgb()  # 原始分辨率
-
+        img_raw = img.copy()
         # resize to 84x84 (W,H) -> (84,84)
         img = cv2.resize(img, (84, 84), interpolation=cv2.INTER_AREA)
 
         imgs = np.repeat(img[None, ...], self.n_obs_steps, axis=0)
-
+        imgs_raw = np.repeat(img_raw[None, ...], self.n_obs_steps, axis=0)
         # robot
         state_all = self.robot.get_all_state() if hasattr(self.robot, "get_all_state") else self.robot.get_state()
         robot_obs = self._map_robot_obs(state_all)
@@ -217,6 +246,7 @@ class RealEnv:
         obs = {"camera_0": imgs}
         obs.update(robot_obs)
         obs.update(gripper_state)
+        obs.update({"raw_camera_0": imgs_raw})
         return obs
 
     # ---------------- control + recording ----------------
@@ -232,12 +262,13 @@ class RealEnv:
             g = 1 if pose[6] > 0.5 else 0
             if g != self._last_grip:
                 control_open_state(g)   # 例如：1=close,0=open（按你的约定）
+                print(f"[GRIP] set to {g} at {ts:.3f}")
                 self._last_grip = g
             if self._recording:
 
                 # store last frame only for dataset (T,H,W,3)
                 self._buf_images.append(obs["camera_0"][-1].astype(np.uint8))
-                self._buf_robot_eef_pose.append(np.asarray(obs["robot_eef_pose"], dtype=np.float32))
+                self._buf_robot_eef_rot.append(np.asarray(obs["robot_eef_pose"], dtype=np.float32)[3:])
                 self._buf_open_state.append(float(self._last_grip))
                 # record robot state (use raw keys for maximal info)
                 state_all = self.robot.get_all_state() if hasattr(self.robot, "get_all_state") else self.robot.get_state()
@@ -258,7 +289,7 @@ class RealEnv:
         self._buf_robot.clear()
         self._buf_actions.clear()
         self._buf_timestamps.clear()
-        self._buf_robot_eef_pose.clear()
+        self._buf_robot_eef_rot.clear()
         self._buf_open_state.clear()
         # create episode dir
         self._episode_dir = self.output_dir / f"episode_{self._episode_idx:04d}"
@@ -284,13 +315,13 @@ class RealEnv:
         images = np.stack(self._buf_images, axis=0)  # (T,H,W,3) RGB uint8
         actions = np.stack(self._buf_actions, axis=0)  # (T, A)
         timestamps = np.asarray(self._buf_timestamps, dtype=np.float64)
-        eef = np.stack(self._buf_robot_eef_pose, axis=0)  # (T,6)
+        eef = np.stack(self._buf_robot_eef_rot, axis=0)  # (T,3)
         gripper_open_state = np.asarray(self._buf_open_state, dtype=np.float32)[:, None]  # (T,1)
 
         # align checks (avoid silent mismatch / crash later)
         assert len(self._buf_actions) == T, f"actions len {len(self._buf_actions)} != T {T}"
         assert len(self._buf_timestamps) == T, f"timestamps len {len(self._buf_timestamps)} != T {T}"
-        assert len(self._buf_robot_eef_pose) == T, f"eef len {len(self._buf_robot_eef_pose)} != T {T}"
+        assert len(self._buf_robot_eef_rot) == T, f"eef len {len(self._buf_robot_eef_rot)} != T {T}"
         assert len(self._buf_open_state) == T, f"open_state len {len(self._buf_open_state)} != T {T}"
 
 
@@ -301,23 +332,23 @@ class RealEnv:
             g_act = f.create_group("action")
 
             g_obs.create_dataset("camera_0", data=images, dtype=np.uint8, compression="gzip", compression_opts=4)
-            g_obs.create_dataset("robot_eef_pose", data=eef, dtype=np.float32)
+            g_obs.create_dataset("robot_eef_rot", data=eef, dtype=np.float32)
             g_obs.create_dataset("gripper_open_state",data=gripper_open_state,dtype=np.float32)
             g_act.create_dataset("target_pose", data=actions, dtype=np.float32)
             f.create_dataset("timestamp", data=timestamps, dtype=np.float64)
 
-            # store robot raw dict as a best-effort (numbers only)
-            g_robot = g_obs.create_group("robot_raw")
-            # collect numeric keys
-            sample = self._buf_robot[0]
-            for k in sample.keys():
-                try:
-                    arr = np.stack([np.asarray(x.get(k)) for x in self._buf_robot], axis=0)
-                    if np.issubdtype(arr.dtype, np.number):
-                        g_robot.create_dataset(k, data=arr.astype(np.float32))
-                except Exception:
-                    # skip non-stackable / non-numeric
-                    pass
+            # # store robot raw dict as a best-effort (numbers only)
+            # g_robot = g_obs.create_group("robot_raw")
+            # # collect numeric keys
+            # sample = self._buf_robot[0]
+            # for k in sample.keys():
+            #     try:
+            #         arr = np.stack([np.asarray(x.get(k)) for x in self._buf_robot], axis=0)
+            #         if np.issubdtype(arr.dtype, np.number):
+            #             g_robot.create_dataset(k, data=arr.astype(np.float32))
+            #     except Exception:
+            #         # skip non-stackable / non-numeric
+            #         pass
 
             # meta
             f.attrs["episode_start_time"] = self._episode_start_time

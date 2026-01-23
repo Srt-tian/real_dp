@@ -1,0 +1,188 @@
+defaults:
+  - _self_
+
+name: train_diffusion_unet_real_h5_image
+_target_: diffusion_policy.workspace.train_diffusion_unet_image_workspace.TrainDiffusionUnetImageWorkspace
+
+task_name: ${task.name}
+shape_meta: ${task.shape_meta}
+exp_name: "default"
+
+# =========================
+# 时间相关（与你 Dataset 对齐）
+# =========================
+horizon: 16
+n_obs_steps: 1          # 你指定：单帧 conditioning
+n_action_steps: 8
+n_latency_steps: 0
+dataset_obs_steps: ${n_obs_steps}
+past_action_visible: False
+keypoint_visible_rate: 1.0
+obs_as_global_cond: True
+
+# =========================
+# Task / Dataset（你的 RealH5ImageDataset）
+# =========================
+task:
+  name: real_h5_image
+
+  env_runner:
+    _target_: diffusion_policy.env_runner.null_image_runner.NullImageRunner
+
+  shape_meta:
+    obs:
+      image:
+        shape: [3, 84, 84]
+        type: rgb
+      state:
+        shape: [4]
+        type: low_dim
+    action:
+      shape: [7]
+
+  dataset:
+    _target_: diffusion_policy.dataset.real_h5_image_dataset.RealH5ImageDataset
+    h5_glob_path: data/demo_real_delta/**/episode.hdf5
+    horizon: ${horizon}
+    pad_before: 2
+    pad_after: 0
+    seed: ${training.seed}
+    val_ratio: 0.05
+    max_train_episodes: null
+
+# =========================
+# Policy（保持官方结构，只改与你数据相关的部分）
+# =========================
+policy:
+  _target_: diffusion_policy.policy.diffusion_unet_image_policy.DiffusionUnetImagePolicy
+  shape_meta: ${shape_meta}
+
+  # 官方 real-image 用 DDIM；稳妥起点沿用
+  noise_scheduler:
+    _target_: diffusers.schedulers.scheduling_ddim.DDIMScheduler
+    num_train_timesteps: 100
+    beta_start: 0.0001
+    beta_end: 0.02
+    beta_schedule: squaredcos_cap_v2
+    clip_sample: True
+    set_alpha_to_one: True
+    steps_offset: 0
+    prediction_type: epsilon
+
+  obs_encoder:
+    _target_: diffusion_policy.model.vision.multi_image_obs_encoder.MultiImageObsEncoder
+    shape_meta: ${shape_meta}
+
+    # 使用 resnet18（不预训练，避免不必要的域偏差；你也可以改成 imagenet 权重）
+    rgb_model:
+      _target_: diffusion_policy.model.vision.model_getter.get_resnet
+      name: resnet18
+      weights: null
+
+    # 关键：禁止 resize/crop 造成 224 或其它尺寸变化
+    # 你的输入就是 84x84，直接用它
+    resize_shape: null
+    crop_shape: [84, 84]
+    random_crop: False
+
+    # 与官方一致：用 GN 避免 EMA+BN 的问题
+    use_group_norm: True
+    share_rgb_model: False
+    imagenet_norm: True
+
+  horizon: ${horizon}
+  n_action_steps: ${eval:'${n_action_steps}+${n_latency_steps}'}
+  n_obs_steps: ${n_obs_steps}
+  num_inference_steps: 100
+  obs_as_global_cond: ${obs_as_global_cond}
+
+  diffusion_step_embed_dim: 128
+  down_dims: [512, 1024, 2048]
+  kernel_size: 5
+  n_groups: 8
+  cond_predict_scale: True
+
+# =========================
+# EMA / Loader / Optim（沿用官方 real-image）
+# =========================
+ema:
+  _target_: diffusion_policy.model.diffusion.ema_model.EMAModel
+  update_after_step: 0
+  inv_gamma: 1.0
+  power: 0.75
+  min_value: 0.0
+  max_value: 0.9999
+
+dataloader:
+  batch_size: 64
+  num_workers: 8
+  shuffle: True
+  pin_memory: True
+  persistent_workers: True
+
+val_dataloader:
+  batch_size: 64
+  num_workers: 8
+  shuffle: False
+  pin_memory: True
+  persistent_workers: True
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-4
+  betas: [0.95, 0.999]
+  eps: 1.0e-8
+  weight_decay: 1.0e-6
+
+training:
+  device: "cuda:0"
+  seed: 42
+  debug: False
+  resume: True
+  lr_scheduler: cosine
+  lr_warmup_steps: 500
+  # 真机数据通常更少，epoch 可以先大一些（或你按自己情况改）
+  num_epochs: 600
+  gradient_accumulate_every: 1
+  use_ema: True
+  freeze_encoder: False
+
+  rollout_every: 3000
+  checkpoint_every: 200
+  val_every: 1
+  sample_every: 5
+
+  max_train_steps: null
+  max_val_steps: null
+  tqdm_interval_sec: 1.0
+
+logging:
+  project: diffusion_policy_debug
+  resume: True
+  mode: online
+  name: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
+  tags: ["${name}", "${task_name}", "${exp_name}"]
+  id: null
+  group: null
+
+checkpoint:
+  topk:
+    monitor_key: train_loss
+    mode: min
+    k: 5
+    format_str: 'epoch={epoch:04d}-train_loss={train_loss:.3f}.ckpt'
+  save_last_ckpt: True
+  save_last_snapshot: False
+
+multi_run:
+  run_dir: data/outputs_delta/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  wandb_name_base: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
+
+hydra:
+  job:
+    override_dirname: ${name}
+  run:
+    dir: data/outputs_delta/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  sweep:
+    dir: data/outputs_delta/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+    subdir: ${hydra.job.num}

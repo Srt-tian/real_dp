@@ -1,7 +1,7 @@
 # min_write_feetech.py
 from serial import Serial
 
-PORT = "/dev/ttyUSB0"  
+PORT = "/dev/ttyACM0"  
 BAUD = 115200
 SERVO_ID = 1
 
@@ -36,9 +36,9 @@ def arrive_goal(goal):
 
 def control_open_state(state: int):
     if state == 0:
-        arrive_goal(4000)
+        arrive_goal(2000)
     elif state == 1:
-        arrive_goal(3200)
+        arrive_goal(920)
     else:
         raise ValueError("state should be 0 (close) or 1 (open)")
     

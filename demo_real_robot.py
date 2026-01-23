@@ -10,7 +10,7 @@ from diffusion_policy.common.precise_sleep import precise_wait
 from diffusion_policy.real_world.keystroke_counter import (
     KeystrokeCounter, Key, KeyCode
 )
-HOME_POSE6 = np.array([-0.09111701 ,-0.72375263 , 0.06410842, -0.14472972, 2.22072607, -2.04910124], dtype=np.float64)
+HOME_POSE6 = np.array([-0.02109733 ,-0.41616943 , 0.13228695 , 0.07429853 , 2.28826478, -2.14155153], dtype=np.float64)
 # Keyboard controls:
 #   q : quit program
 #   c : start recording a new episode
@@ -30,10 +30,10 @@ def get_keyboard_delta_from_events(press_events, key_counter, pos_step, rot_step
 
     for ev in press_events:
         # translation
-        if ev == KeyCode(char='w'): dpos[0] += 1
-        elif ev == KeyCode(char='s'): dpos[0] -= 1
-        elif ev == KeyCode(char='d'): dpos[1] += 1
-        elif ev == KeyCode(char='a'): dpos[1] -= 1
+        if ev == KeyCode(char='a'): dpos[0] += 1
+        elif ev == KeyCode(char='d'): dpos[0] -= 1
+        elif ev == KeyCode(char='w'): dpos[1] -= 1
+        elif ev == KeyCode(char='s'): dpos[1] += 1
         elif ev == KeyCode(char='r'): dpos[2] += 1
         elif ev == KeyCode(char='f'): dpos[2] -= 1
 
@@ -53,10 +53,9 @@ def get_keyboard_delta_from_events(press_events, key_counter, pos_step, rot_step
 @click.command()
 @click.option('--output', '-o', required=True, help="Directory to save demonstration dataset.")
 @click.option('--robot_ip', '-ri', required=True, help="UR5 IP address, e.g. 192.168.0.204")
-@click.option('--init_joints', '-j', is_flag=True, default=False)
-@click.option('--frequency', '-f', default=10.0, type=float)
+@click.option('--frequency', '-f', default=5.0, type=float)
 @click.option('--command_latency', '-cl', default=0.01, type=float)
-def main(output, robot_ip, init_joints, frequency, command_latency):
+def main(output, robot_ip, frequency, command_latency):
     dt = 1.0 / frequency
     open_state = 0  # start open
     goto_home = False
@@ -68,7 +67,7 @@ def main(output, robot_ip, init_joints, frequency, command_latency):
                  obs_image_resolution=(1280, 720),
                  frequency=frequency,
                  n_obs_steps=1,
-                 usb_cam_id=0
+                 usb_cam_id=2
              ) as env:
 
             cv2.setNumThreads(1)
@@ -131,25 +130,18 @@ def main(output, robot_ip, init_joints, frequency, command_latency):
                         goto_home = True
 
                 # visualize (USB cam is always camera_0)
-                scale = 6
-                vis_img = obs["camera_0"][-1, :, :, ::-1].copy()
-                vis_img_big = cv2.resize(
-                    vis_img,
-                    (84 * scale, 84 * scale),
-                    interpolation=cv2.INTER_NEAREST  # UI 用最近邻最清晰
-                )
+                vis_img = obs["raw_camera_0"][-1, :, :, ::-1].copy()
                 text = f""
                 if is_recording:
                     text += " | Recording"
                 cv2.putText(
-                    vis_img_big, text, (10, 30),
+                    vis_img, text, (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.0,
                     (255, 255, 255), 2
                 )
-                cv2.imshow("teleop", vis_img_big)
-                cv2.pollKey()
+                cv2.imshow("teleop", vis_img)
+                cv2.waitKey(1)
 
-                precise_wait(t_sample)
 
                 # teleop
                 pos_step = 0.002   # 2mm per press
@@ -173,8 +165,11 @@ def main(output, robot_ip, init_joints, frequency, command_latency):
                 #     timestamps=[t_command_target - time.monotonic() + time.time()],
                 #     stages=[stage],
                 # )
+                precise_wait(t_sample)
+
                 now_wall = time.time()
-                lead = max(2.0 * dt, 0.05)   # >= 2 control cycles or 50ms
+                # lead = max(2.0 * dt, 0.05)   # >= 2 control cycles or 50ms
+                lead = 0.05
                 ts_cmd = now_wall + lead
 
                 env.exec_actions(
@@ -185,7 +180,8 @@ def main(output, robot_ip, init_joints, frequency, command_latency):
 
                 precise_wait(t_cycle_end)
                 iter_idx += 1
-
+                if iter_idx % 50 == 0:
+                    print("lateness(ms)=", (time.monotonic() - t_cycle_end) * 1000)
 
 if __name__ == "__main__":
     main()
