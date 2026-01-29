@@ -32,7 +32,7 @@ task:
   shape_meta:
     obs:
       image:
-        shape: [3, 84, 84]
+        shape: [3, 128, 128]
         type: rgb
       state:
         shape: [4]
@@ -82,7 +82,7 @@ policy:
     # 关键：禁止 resize/crop 造成 224 或其它尺寸变化
     # 你的输入就是 84x84，直接用它
     resize_shape: null
-    crop_shape: [84, 84]
+    crop_shape: [128, 128]
     random_crop: False
 
     # 与官方一致：用 GN 避免 EMA+BN 的问题
@@ -114,14 +114,14 @@ ema:
   max_value: 0.9999
 
 dataloader:
-  batch_size: 64
+  batch_size: 16
   num_workers: 8
   shuffle: True
   pin_memory: True
   persistent_workers: True
 
 val_dataloader:
-  batch_size: 64
+  batch_size: 16
   num_workers: 8
   shuffle: False
   pin_memory: True
@@ -148,7 +148,7 @@ training:
   freeze_encoder: False
 
   rollout_every: 3000
-  checkpoint_every: 200
+  checkpoint_every: 50
   val_every: 1
   sample_every: 5
 

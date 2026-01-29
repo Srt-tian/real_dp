@@ -9,8 +9,10 @@ from diffusion_policy.real_world.real_env import RealEnv
 from diffusion_policy.common.precise_sleep import precise_wait
 import hydra
 from omegaconf import OmegaConf
-mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)[:, None, None]
-std  = np.array([0.229, 0.224, 0.225], dtype=np.float32)[:, None, None]
+# 限制增量幅度
+max_dpos_norm = 0.016
+max_drot_norm = 0.07
+
 def to_torch(x, device):
     if isinstance(x, torch.Tensor):
         return x.to(device)
@@ -31,7 +33,7 @@ def build_obs_dict(
     image_key="camera_0",
     rot_key="robot_eef_rot",
     grip_key="gripper_open_state",
-    img_hw=(84, 84),
+    img_hw=(128, 128),
 ):
     """
     输出匹配你训练时的 shape_meta:
@@ -43,7 +45,7 @@ def build_obs_dict(
     if (img.shape[0], img.shape[1]) != img_hw:
         img = cv2.resize(img, (img_hw[1], img_hw[0]), interpolation=cv2.INTER_AREA)
     img = (img.astype(np.float32) / 255.0).transpose(2, 0, 1)  # CHW
-    img = (img - mean) / std
+    # img = (img - mean) / std
     # state: rot(3) + gripper(1)
     rot3 = np.asarray(last_frame(obs[rot_key]), dtype=np.float32).reshape(3)
     grip = np.asarray(last_frame(obs[grip_key]), dtype=np.float32).reshape(-1)
@@ -140,7 +142,6 @@ def action_seq_to_target_poses(
     """
     k = action_seq.shape[0]
     out = []
-
     if action_mode == "absolute":
         for i in range(k):
             p7 = np.zeros(7, dtype=np.float64)
@@ -154,25 +155,37 @@ def action_seq_to_target_poses(
     if action_mode == "delta":
         pose6 = base_target_pose6.astype(np.float64).copy()
         R_abs = R.from_rotvec(pose6[3:6])
+        
 
         for i in range(k):
             d = action_seq[i].astype(np.float64)
 
-            # Δpos
-            pose6[:3] += d[:3]
+            # xyz delta
+            dpos = d[:3]
+            pn = np.linalg.norm(dpos)
+            if pn > max_dpos_norm:
+                dpos = dpos * (max_dpos_norm / (pn + 1e-8))
+            pose6[:3] += dpos
 
+            # rot delta
             # Δrot (SO(3), left-multiply)
-            dR = R.from_rotvec(d[3:6])
+            drot = d[3:6]
+            if max_drot_norm <= 1e-8:
+                drot = np.zeros(3, dtype=np.float64)
+            else:
+                rn = np.linalg.norm(drot)
+                if rn > max_drot_norm:
+                    drot = drot * (max_drot_norm / (rn + 1e-8))
+            dR = R.from_rotvec(drot)
             R_abs = dR * R_abs
             pose6[3:6] = R_abs.as_rotvec()
 
             # grip (binarize)
             g = float(d[6])
             g = 1.0 if g > 0.5 else 0.0
-
             p7 = np.zeros(7, dtype=np.float64)
             p7[:6] = pose6
-            p7[6] = g
+            p7[6] = g 
             out.append(p7)
 
         return out
@@ -188,13 +201,18 @@ def action_seq_to_target_poses(
 @click.option("--steps_per_infer", default=1, type=int, help="每次推理执行前 k 步（闭环更稳：1~4）")
 @click.option("--action_mode", type=click.Choice(["delta", "absolute"]), default="delta",
               help="delta=累加Δpose后发绝对目标；absolute=直接把action当绝对pose发送")
-@click.option("--img_h", default=84, type=int)
-@click.option("--img_w", default=84, type=int)
+@click.option("--img_h", default=128, type=int)
+@click.option("--img_w", default=128, type=int)
 @click.option("--device", default="cuda:0", type=str)
 def main(ckpt, robot_ip, usb_cam_id, frequency, steps_per_infer, action_mode, img_h, img_w, device):
     dt = 1.0 / float(frequency)
     policy = load_policy_from_ckpt(ckpt, device=device)
-
+    # --- make inference deterministic/consistent like check_policy.py ---
+    # steps = 10
+    # if hasattr(policy, "num_inference_steps"):
+    #     policy.num_inference_steps = steps
+    # if hasattr(policy, "noise_scheduler") and hasattr(policy.noise_scheduler, "set_timesteps"):
+    #     policy.noise_scheduler.set_timesteps(steps, device=device)
     with RealEnv(
         output_dir=".",                  # 推理不写数据，给占位
         robot_ip=robot_ip,
@@ -209,31 +227,42 @@ def main(ckpt, robot_ip, usb_cam_id, frequency, steps_per_infer, action_mode, im
         print(f"[INFO] action_mode={action_mode}, dt={dt:.3f}s, steps_per_infer={steps_per_infer}")
         print("Press 'q' to quit.")
 
-        t_start = time.monotonic()
-        it = 0
+        warm_flag = False
         k = steps_per_infer
+
         while True:
-            chunk_dt = 20 * dt
-            t_cycle_end = t_start + (it + 1) * chunk_dt
+            if not warm_flag:
+                obs = env.get_obs()
+                warm_flag = True
+                continue
             # 1) get obs (如果偶发空序列，简单跳过)
             obs = env.get_obs()
-            if "raw_camera_0" not in obs or obs["raw_camera_0"].shape[0] == 0:
-                precise_wait(t_cycle_end)
-                it += 1
+            # IMPORTANT: check the SAME key you will use for inference
+            if "camera_0" not in obs or obs["camera_0"].shape[0] == 0:
+                time.sleep(0.01)
                 continue
 
             # 8) visualize (cv2 expects BGR)
-            vis = obs["raw_camera_0"][-1, :, :, ::-1].copy()
-            cv2.putText(
+            vis = obs["camera_0"][-1, :, :, ::-1].copy()
+            scale = 4
+            vis_big = cv2.resize(
                 vis,
+                (vis.shape[1] * scale, vis.shape[0] * scale),
+                interpolation=cv2.INTER_NEAREST  # 保持像素块，不模糊
+            )
+
+            cv2.putText(
+                vis_big,
                 f"mode={action_mode} k={k}",
-                (10, 30),
+                (10, 40),                    # 放大后坐标
                 cv2.FONT_HERSHEY_SIMPLEX,
-                1.0,
+                1.0,                         # 字体大小现在正合适
                 (255, 255, 255),
                 2,
             )
-            cv2.imshow("infer", vis)
+
+            cv2.imshow("infer", vis_big)
+
             if (cv2.waitKey(1) & 0xFF) == ord("q"):
                 break
 
@@ -255,6 +284,15 @@ def main(ckpt, robot_ip, usb_cam_id, frequency, steps_per_infer, action_mode, im
             # import pdb; pdb.set_trace()
             # 3) policy inference -> (H,7)
             with torch.no_grad():
+                # debug
+                # for k, v in obs_dict.items():
+                #     if torch.is_tensor(v):
+                #         print("[IN ]", k, tuple(v.shape), v.dtype, v.device)
+                #     elif isinstance(v, dict):
+                #         print("[IN ]", k, {kk: (tuple(vv.shape) if torch.is_tensor(vv) else type(vv)) for kk, vv in v.items()})
+
+                # print("[EXP] key_shape_map =", {k: tuple(s) for k, s in policy.obs_encoder.key_shape_map.items()})
+                # import pdb; pdb.set_trace()
                 out = policy.predict_action(obs_dict)
                 action_all = out["action"][0].detach().cpu().numpy()  # (H,7)
             assert action_all.shape[-1] == 7, f"expected action_dim=7, got {action_all.shape}"
@@ -294,10 +332,13 @@ def main(ckpt, robot_ip, usb_cam_id, frequency, steps_per_infer, action_mode, im
                 actions=[p.copy() for p in pose_list],
                 timestamps=ts,
             )
+            buffer = 0.08
+            t_next = ts[-1] + dt + buffer
+            sleep_s = t_next - time.time()
+            if sleep_s > 0:
+                time.sleep(sleep_s)
 
 
-            precise_wait(t_cycle_end)
-            it += 1
 
 
 

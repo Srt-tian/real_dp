@@ -1,77 +1,75 @@
 import argparse
+import time
 import numpy as np
 import torch
 import h5py
 import cv2
-from scipy.spatial.transform import Rotation as R
 import hydra
 from omegaconf import OmegaConf
-import time
 from torch.cuda.amp import autocast
+
+IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+IMAGENET_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
 def to_torch(x, device):
     if isinstance(x, torch.Tensor):
         return x.to(device)
     return torch.from_numpy(x).to(device)
 
+def normalize_img(img_hwc_uint8: np.ndarray, mode: str) -> np.ndarray:
+    """
+    img_hwc_uint8: (H,W,3) uint8 RGB
+    return: CHW float32
+    """
+    img = img_hwc_uint8.astype(np.float32) / 255.0  # -> [0,1], HWC
 
-def last_frame(x):
-    x = np.asarray(x)
-    return x[-1] if x.ndim >= 2 else x
+    if mode == "0_1":
+        pass
+    elif mode == "imagenet":
+        img = (img - IMAGENET_MEAN) / IMAGENET_STD
+    elif mode == "-1_1":
+        img = img * 2.0 - 1.0
+    else:
+        raise ValueError(f"unknown img_norm={mode}")
+
+    return img.transpose(2, 0, 1)  # CHW
 
 def gpu_sanity_check(policy, obs_dict):
     print("[CUDA] available:", torch.cuda.is_available())
     if torch.cuda.is_available():
         print("[CUDA] device:", torch.cuda.get_device_name(0))
+    try:
         print("[CUDA] policy param device:", next(policy.parameters()).device)
-        for k, v in obs_dict.items():
-            if isinstance(v, torch.Tensor):
-                print(f"[CUDA] obs[{k}] device:", v.device, "dtype:", v.dtype, "shape:", tuple(v.shape))
+    except StopIteration:
+        print("[CUDA] policy has no parameters??")
 
-def find_step_fields(obj, max_depth=2, prefix="policy"):
-    hits = []
-    for name in dir(obj):
-        if "step" in name.lower() or "timestep" in name.lower():
-            try:
-                val = getattr(obj, name)
-                if isinstance(val, (int, float, str, list, tuple)):
-                    hits.append((f"{prefix}.{name}", val))
-            except Exception:
-                pass
-    # 常见：policy 里还有 scheduler / noise_scheduler
-    for sub_name in ["scheduler", "noise_scheduler", "diffusion", "model"]:
-        if hasattr(obj, sub_name):
-            sub = getattr(obj, sub_name)
-            for name in dir(sub):
-                if "step" in name.lower() or "timestep" in name.lower():
-                    try:
-                        val = getattr(sub, name)
-                        if isinstance(val, (int, float, str, list, tuple)):
-                            hits.append((f"{prefix}.{sub_name}.{name}", val))
-                    except Exception:
-                        pass
-    return hits
+    for k, v in obs_dict.items():
+        if isinstance(v, torch.Tensor):
+            print(f"[CUDA] obs[{k}] device:", v.device, "dtype:", v.dtype, "shape:", tuple(v.shape))
 
-def find_sampler_fields(obj):
-    keys = []
-    for name in dir(obj):
-        if any(s in name.lower() for s in ["ddim", "dpm", "solver", "scheduler"]):
-            keys.append(name)
-    return keys
-
-def timed_predict(policy, obs_dict, iters=10, warmup=3):
-    # 只测 predict_action（不包含 .cpu().numpy()），并做同步，得到“真实GPU耗时”
-    assert torch.cuda.is_available(), "CUDA not available"
+def timed_predict(policy, obs_dict, iters=10, warmup=3, use_amp=True):
+    """只测 predict_action（不包含 .cpu().numpy()），并做 synchronize 得到真实 GPU 耗时。"""
+    if not torch.cuda.is_available():
+        print("[TIME] CUDA not available, skip GPU timing.")
+        return
     # warmup
     for _ in range(warmup):
         with torch.no_grad():
-            _ = policy.predict_action(obs_dict)
+            if use_amp:
+                with autocast():
+                    _ = policy.predict_action(obs_dict)
+            else:
+                _ = policy.predict_action(obs_dict)
     torch.cuda.synchronize()
 
     t0 = time.time()
     for _ in range(iters):
         with torch.no_grad():
-            _ = policy.predict_action(obs_dict)
+            if use_amp:
+                with autocast():
+                    _ = policy.predict_action(obs_dict)
+            else:
+                _ = policy.predict_action(obs_dict)
     torch.cuda.synchronize()
     t1 = time.time()
     print(f"[TIME] predict_action avg: {(t1 - t0) * 1000 / iters:.2f} ms (GPU-synchronized, excl. cpu copy)")
@@ -104,8 +102,8 @@ def load_policy_from_ckpt(ckpt_path, device="cuda:0"):
     else:
         raise RuntimeError("ckpt['state_dicts'] missing ema_model/model")
 
-    def strip_prefix(sd, prefix):
-        return {k[len(prefix):]: v for k, v in sd.items() if k.startswith(prefix)}
+    def strip_prefix(sd_in, prefix):
+        return {k[len(prefix):]: v for k, v in sd_in.items() if k.startswith(prefix)}
 
     policy_sd_keys = set(policy.state_dict().keys())
     if set(sd.keys()) != policy_sd_keys:
@@ -118,38 +116,44 @@ def load_policy_from_ckpt(ckpt_path, device="cuda:0"):
 
     missing, unexpected = policy.load_state_dict(sd, strict=False)
     print(f"[LOAD] missing={len(missing)} unexpected={len(unexpected)}")
+
     policy.to(device).eval()
     return policy
 
-
-def build_obs_dict_from_arrays(img_hwc_uint8, rot3, grip, device, img_hw=(84, 84)):
+def build_obs_dict_from_arrays(
+    img_hwc_uint8,
+    rot3,
+    grip,
+    device,
+    img_hw=(84, 84),
+    img_norm="0_1",
+):
     """
     img_hwc_uint8: (H,W,3) RGB uint8
     rot3: (3,) rotvec
     grip: scalar (0/1)
     output:
-      obs.image: (1,1,3,H,W) float32 [0,1]
-      obs.state: (1,1,4) float32
+      obs["image"]: (1,1,3,H,W) float32
+      obs["state"]: (1,1,4) float32
     """
-    img = img_hwc_uint8
-    if (img.shape[0], img.shape[1]) != img_hw:
-        img = cv2.resize(img, (img_hw[1], img_hw[0]), interpolation=cv2.INTER_AREA)
-    img = (img.astype(np.float32) / 255.0).transpose(2, 0, 1)  # CHW
+    if (img_hwc_uint8.shape[0], img_hwc_uint8.shape[1]) != img_hw:
+        img_hwc_uint8 = cv2.resize(img_hwc_uint8, (img_hw[1], img_hw[0]), interpolation=cv2.INTER_AREA)
+
+    img_chw = normalize_img(img_hwc_uint8, img_norm).astype(np.float32)
 
     rot3 = np.asarray(rot3, dtype=np.float32).reshape(3)
-    grip = float(grip)
+    grip = float(np.asarray(grip).reshape(-1)[0])
     state = np.concatenate([rot3, np.array([grip], dtype=np.float32)], axis=0).astype(np.float32)
 
     return {
-        "image": to_torch(img[None, None, ...], device),
-        "state": to_torch(state[None, None, ...], device),
+        "image": to_torch(img_chw[None, None, ...], device).float(),
+        "state": to_torch(state[None, None, ...], device).float(),
     }
-
 
 def find_episode_root(h5: h5py.File):
     """
     兼容两种常见结构：
-      A) /obs/camera_0, /obs/robot_eef_rot, /action ...
+      A) /obs/..., /action ...
       B) /data/demo_0/obs/..., /data/demo_0/actions ...
     返回 (obs_group, action_array or None)
     """
@@ -157,7 +161,6 @@ def find_episode_root(h5: h5py.File):
         obs_g = h5["obs"]
         act = None
         if "action" in h5:
-            # 可能是 (T,7) 或 group
             if isinstance(h5["action"], h5py.Dataset):
                 act = h5["action"][...]
             elif isinstance(h5["action"], h5py.Group) and "target_pose" in h5["action"]:
@@ -166,7 +169,6 @@ def find_episode_root(h5: h5py.File):
 
     if "data" in h5:
         data_g = h5["data"]
-        # pick first demo
         demo_keys = sorted(list(data_g.keys()))
         if len(demo_keys) == 0:
             raise RuntimeError("No demos found under /data")
@@ -181,7 +183,6 @@ def find_episode_root(h5: h5py.File):
 
     raise RuntimeError("Unknown hdf5 layout: expected /obs or /data")
 
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", required=True, type=str)
@@ -193,24 +194,20 @@ def main():
     ap.add_argument("--img_h", default=84, type=int)
     ap.add_argument("--img_w", default=84, type=int)
     ap.add_argument("--max_T", default=200, type=int)
-    ap.add_argument("--action_from", default="auto", choices=["auto", "action", "target_pose", "actions"],
-                    help="which dataset to compare against if available")
+    ap.add_argument("--eval_T", default=10, type=int, help="how many timesteps to compare per mode")
+    ap.add_argument("--use_amp", action="store_true", help="use autocast for predict_action")
     args = ap.parse_args()
 
     policy = load_policy_from_ckpt(args.ckpt, device=args.device)
+
+    # set diffusion inference steps if available
     steps = 10
-    policy.num_inference_steps = steps
-    policy.noise_scheduler.set_timesteps(steps, device="cuda")
-    print("-------------------------------------------------------")
-    # print(type(policy))
-    # print("\n".join([f"{k} = {v}" for k,v in find_step_fields(policy)]))
-    # print(find_sampler_fields(policy))
-    print(type(policy.noise_scheduler))
-    print(hasattr(policy.noise_scheduler, "config"), hasattr(policy.noise_scheduler, "set_timesteps"))
-    print("-------------------------------------------------------")
-    for sub in ["scheduler", "noise_scheduler"]:
-        if hasattr(policy, sub):
-            print(sub, find_sampler_fields(getattr(policy, sub)))
+    if hasattr(policy, "num_inference_steps"):
+        policy.num_inference_steps = steps
+    if hasattr(policy, "noise_scheduler") and hasattr(policy.noise_scheduler, "set_timesteps"):
+        # device can be "cuda:0" / "cpu"
+        policy.noise_scheduler.set_timesteps(steps, device=args.device)
+
     with h5py.File(args.h5, "r") as h5:
         obs_g, act_gt = find_episode_root(h5)
 
@@ -223,60 +220,85 @@ def main():
         grips = obs_g[args.grip_key][...]
 
         T = min(len(imgs), args.max_T)
-        print(f"[INFO] loaded T={len(imgs)} (use {T})")
+        Teval = min(T, args.eval_T)
+
+        print(f"[INFO] loaded T={len(imgs)} (use {T}) eval_T={Teval}")
         print(f"[INFO] img shape: {imgs.shape}, rot shape: {rots.shape}, grip shape: {grips.shape}")
         if act_gt is not None:
             print(f"[INFO] gt action shape: {act_gt.shape}")
-
-        preds = []
-        gts = []
-
-        for t in range(5):
-            img = imgs[t]
-            rot3 = rots[t] if np.asarray(rots).ndim >= 2 else rots  # allow (T,3) or (3,)
-            grip = grips[t] if np.asarray(grips).ndim >= 2 else grips  # allow (T,1) or (1,)
-            grip = float(np.asarray(grip).reshape(-1)[0])
-
-            obs_dict = build_obs_dict_from_arrays(
-                img_hwc_uint8=img,
-                rot3=rot3,
-                grip=grip,
-                device=args.device,
-                img_hw=(args.img_h, args.img_w),
-            )
-            if t == 0:
-                gpu_sanity_check(policy, obs_dict)
-                timed_predict(policy, obs_dict, iters=10, warmup=3)
-
-            t1 = time.time()
-            with torch.no_grad():
-                with autocast():
-                    out = policy.predict_action(obs_dict)
-                    a = out["action"][0, 0].detach().cpu().numpy()  # 取第一步 (7,)
-            t2 = time.time()
-            print(f"[WARMUP] t={t} policy inference time: {(t2 - t1)*1000:.2f} ms")
-            preds.append(a)
-
-            if act_gt is not None and t < len(act_gt):
-                gts.append(act_gt[t])
-
-        preds = np.asarray(preds, dtype=np.float32)
-        print("[PRED] action stats:", "mean", preds.mean(axis=0), "std", preds.std(axis=0))
-
-        if len(gts) > 0:
-            gts = np.asarray(gts, dtype=np.float32)
-            # 维度对齐：有些保存的是 (T,7)；有些是 (T,?)，只比较前7
-            D = min(preds.shape[1], gts.shape[1])
-            diff = preds[:, :D] - gts[:, :D]
-            mae = np.mean(np.abs(diff), axis=0)
-            mse = np.mean(diff ** 2, axis=0)
-            print("[COMPARE] D=", D)
-            print("[COMPARE] MAE per-dim:", mae)
-            print("[COMPARE] MSE per-dim:", mse)
-            print("[COMPARE] MAE mean:", float(np.mean(mae)), "MSE mean:", float(np.mean(mse)))
         else:
-            print("[WARN] no ground-truth actions found in this h5 layout; printed prediction stats only.")
+            print("[WARN] no ground-truth action found in this h5 layout; will only print prediction stats.")
 
+        # one-time sanity + timing with default mode 0_1 at t=0
+        obs0 = build_obs_dict_from_arrays(
+            img_hwc_uint8=imgs[0],
+            rot3=rots[0],
+            grip=grips[0],
+            device=args.device,
+            img_hw=(args.img_h, args.img_w),
+            img_norm="0_1",
+        )
+        gpu_sanity_check(policy, obs0)
+        timed_predict(policy, obs0, iters=10, warmup=3, use_amp=args.use_amp)
+
+        results = {}
+        for IMG_NORM in ["0_1", "imagenet", "-1_1"]:
+            print("\n" + "=" * 80)
+            print(f"[RUN] img_norm = {IMG_NORM}")
+            print("=" * 80)
+
+            maes = []
+            preds = []
+            gts = []
+
+            for t in range(Teval):
+                obs_dict = build_obs_dict_from_arrays(
+                    img_hwc_uint8=imgs[t],
+                    rot3=rots[t],
+                    grip=grips[t],
+                    device=args.device,
+                    img_hw=(args.img_h, args.img_w),
+                    img_norm=IMG_NORM,
+                )
+
+                with torch.no_grad():
+                    if args.use_amp:
+                        with autocast():
+                            out = policy.predict_action(obs_dict)
+                    else:
+                        out = policy.predict_action(obs_dict)
+
+                # out["action"] usually shape: (B, T_action, D)
+                if not isinstance(out, dict) or "action" not in out:
+                    raise RuntimeError(f"policy.predict_action output unexpected: {type(out)} keys={getattr(out, 'keys', lambda: [])()}")
+
+                a = out["action"][0, 0].detach().float().cpu().numpy()  # first step (D,)
+                preds.append(a)
+
+                if act_gt is not None and t < len(act_gt):
+                    gt = np.asarray(act_gt[t]).reshape(-1)
+                    D = min(len(a), len(gt))
+                    gts.append(gt[:D])
+                    maes.append(float(np.mean(np.abs(a[:D] - gt[:D]))))
+
+            preds = np.asarray(preds, dtype=np.float32)
+            print("[PRED] action stats:", "mean", preds.mean(axis=0), "std", preds.std(axis=0))
+
+            if act_gt is not None and len(maes) > 0:
+                mae_mean = float(np.mean(maes))
+                print(f"[RESULT] img_norm={IMG_NORM} | MAE mean = {mae_mean:.8f} (over {len(maes)} steps)")
+                results[IMG_NORM] = mae_mean
+            else:
+                print(f"[RESULT] img_norm={IMG_NORM} | (no GT)")
+
+        if results:
+            best = min(results.items(), key=lambda kv: kv[1])
+            print("\n" + "-" * 80)
+            print("[SUMMARY] MAE mean per mode:")
+            for k, v in results.items():
+                print(f"  - {k:8s}: {v:.8f}")
+            print(f"[BEST] {best[0]}  (MAE mean={best[1]:.8f})")
+            print("-" * 80)
 
 if __name__ == "__main__":
     main()

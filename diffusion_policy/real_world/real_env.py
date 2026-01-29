@@ -38,10 +38,8 @@ class _USBCamera:
     def read_rgb(self) -> np.ndarray:
         # 尽量清空缓冲：限时 + 限次，避免极端情况卡住
         t0 = time.time()
-        n = 0
         while (time.time() - t0) < 0.01:
             self.cap.grab()
-            n += 1
 
         ok, frame_bgr = self.cap.retrieve()
 
@@ -233,12 +231,10 @@ class RealEnv:
         """
         # camera
         img = self.camera.read_rgb()  # 原始分辨率
-        img_raw = img.copy()
         # resize to 84x84 (W,H) -> (84,84)
-        img = cv2.resize(img, (84, 84), interpolation=cv2.INTER_AREA)
+        img = cv2.resize(img, (128, 128), interpolation=cv2.INTER_AREA)
 
         imgs = np.repeat(img[None, ...], self.n_obs_steps, axis=0)
-        imgs_raw = np.repeat(img_raw[None, ...], self.n_obs_steps, axis=0)
         # robot
         state_all = self.robot.get_all_state() if hasattr(self.robot, "get_all_state") else self.robot.get_state()
         robot_obs = self._map_robot_obs(state_all)
@@ -246,7 +242,6 @@ class RealEnv:
         obs = {"camera_0": imgs}
         obs.update(robot_obs)
         obs.update(gripper_state)
-        obs.update({"raw_camera_0": imgs_raw})
         return obs
 
     # ---------------- control + recording ----------------

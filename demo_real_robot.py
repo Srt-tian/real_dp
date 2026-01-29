@@ -10,7 +10,7 @@ from diffusion_policy.common.precise_sleep import precise_wait
 from diffusion_policy.real_world.keystroke_counter import (
     KeystrokeCounter, Key, KeyCode
 )
-HOME_POSE6 = np.array([-0.02109733 ,-0.41616943 , 0.13228695 , 0.07429853 , 2.28826478, -2.14155153], dtype=np.float64)
+HOME_POSE6 = np.array([-0.02108064, -0.41618731, 0.10030958, 0.07430297, 2.28816994, -2.14159624], dtype=np.float64)
 # Keyboard controls:
 #   q : quit program
 #   c : start recording a new episode
@@ -130,19 +130,37 @@ def main(output, robot_ip, frequency, command_latency):
                         goto_home = True
 
                 # visualize (USB cam is always camera_0)
-                vis_img = obs["raw_camera_0"][-1, :, :, ::-1].copy()
+                # vis_img = obs["raw_camera_0"][-1, :, :, ::-1].copy()
                 text = f""
                 if is_recording:
                     text += " | Recording"
-                cv2.putText(
-                    vis_img, text, (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0,
-                    (255, 255, 255), 2
+                # cv2.putText(
+                #     vis_img, text, (10, 30),
+                #     cv2.FONT_HERSHEY_SIMPLEX, 1.0,
+                #     (255, 255, 255), 2
+                # )
+                # cv2.imshow("teleop", vis_img)
+                # cv2.waitKey(1)
+                vis = obs["camera_0"][-1, :, :, ::-1].copy()
+                scale = 4
+                vis_big = cv2.resize(
+                    vis,
+                    (vis.shape[1] * scale, vis.shape[0] * scale),
+                    interpolation=cv2.INTER_NEAREST  # 保持像素块，不模糊
                 )
-                cv2.imshow("teleop", vis_img)
+
+                cv2.putText(
+                    vis_big,
+                    text,
+                    (10, 40),                    # 放大后坐标
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1.0,                         # 字体大小现在正合适
+                    (255, 255, 255),
+                    2,
+                )
+
+                cv2.imshow("infer", vis_big)
                 cv2.waitKey(1)
-
-
                 # teleop
                 pos_step = 0.002   # 2mm per press
                 rot_step = 0.035   # ~2deg per press (0.035 rad)
