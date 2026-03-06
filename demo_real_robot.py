@@ -10,7 +10,8 @@ from diffusion_policy.common.precise_sleep import precise_wait
 from diffusion_policy.real_world.keystroke_counter import (
     KeystrokeCounter, Key, KeyCode
 )
-HOME_POSE6 = np.array([-0.02108064, -0.41618731, 0.10030958, 0.07430297, 2.28816994, -2.14159624], dtype=np.float64)
+# HOME_POSE6 = np.array([-0.02108064, -0.41618731, 0.10030958, 0.07430297, 2.28816994, -2.14159624], dtype=np.float64)
+HOME_POSE6 = np.array([ 5.40684897e-01, -1.21812010e-01,  7.80524852e-02, -1.55916831e-04,-6.42017310e-05,  1.06593088e-03], dtype=np.float64)
 # Keyboard controls:
 #   q : quit program
 #   c : start recording a new episode
@@ -67,7 +68,7 @@ def main(output, robot_ip, frequency, command_latency):
                  obs_image_resolution=(1280, 720),
                  frequency=frequency,
                  n_obs_steps=1,
-                 usb_cam_id=2
+                 usb_cam_id=0
              ) as env:
 
             cv2.setNumThreads(1)

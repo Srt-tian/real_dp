@@ -6,5 +6,3 @@ while True:
     cv2.imshow("USB Camera Frame", img )
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
-my_cam.release()
-cv2.destroyAllWindows()

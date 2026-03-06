@@ -11,6 +11,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 
 from std_msgs.msg import Float32MultiArray
 from px4_msgs.msg import VehicleOdometry 
+from geometry_msgs.msg import PoseStamped
 
 
 def now_us() -> int:
@@ -37,8 +38,8 @@ def quat_wxyz_to_rotvec(w, x, y, z):
 class RosBridge(Node):
     def __init__(
         self,
-        listen_topic="/fam1/fmu/in/vehicle_visual_odometry",
-        action_topic="/vla/action_7d",
+        listen_topic="/vrpn/rb_hexa/pose",
+        action_topic="/vla/action_8d",
         udp_state_port=15001,
         udp_action_port=15000,
         udp_ip="127.0.0.1",
@@ -54,8 +55,10 @@ class RosBridge(Node):
         self._print_cnt = 0
         # Subscribe VehicleOdometry
         self._latest_rotvec = np.zeros(3, dtype=np.float32)
+        self._latest_quat_wxyz = np.array([1,0,0,0], dtype=np.float32) 
+        self._latest_pos = np.zeros(3, dtype=np.float32)
         self._lock = threading.Lock()
-        self.create_subscription(VehicleOdometry, listen_topic, self._odom_cb, qos)
+        self.create_subscription(PoseStamped, listen_topic, self._odom_cb, qos)
 
         # Publish action to "upper computer node"
         self.action_pub = self.create_publisher(Float32MultiArray, action_topic, qos)
@@ -69,33 +72,49 @@ class RosBridge(Node):
         self.udp_rx.bind((udp_ip, udp_action_port))
         self.udp_rx.setblocking(False)
 
-        self.get_logger().info(f"Sub  : {listen_topic} (VehicleOdometry)")
+        self.get_logger().info(f"Sub  : {listen_topic} (PoseStamped)")
         self.get_logger().info(f"Pub  : {action_topic} (Float32MultiArray len=7)")
         self.get_logger().info(f"UDP-> : {udp_ip}:{udp_state_port} (state rotvec)")
-        self.get_logger().info(f"UDP<- : {udp_ip}:{udp_action_port} (action 7d)")
+        self.get_logger().info(f"UDP<- : {udp_ip}:{udp_action_port} (action 8d)")
 
         # timers
         self.create_timer(0.02, self._push_state_udp)   # 50Hz state push
         self.create_timer(0.005, self._poll_actions)    # 200Hz poll actions
 
-    def _odom_cb(self, msg: VehicleOdometry):
+    def _odom_cb(self, msg: PoseStamped):
         # msg.q is (w,x,y,z) per your msg definition
-        w, x, y, z = msg.q
+        # import pdb; pdb.set_trace()
+        w, x, y, z = msg.pose.orientation.w, msg.pose.orientation.x, msg.pose.orientation.y, msg.pose.orientation.z
+        p_x,p_y,p_z = msg.pose.position.x, msg.pose.position.y, msg.pose.position.z
+        # import pdb; pdb.set_trace()
         rotvec = quat_wxyz_to_rotvec(w, x, y, z)
+        q = np.array([w, x, y, z], dtype=np.float64)
+        n = np.linalg.norm(q)
+        if n < 1e-12:
+            q = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+        else:
+            q = q / n
+        if q[0] < 0:
+            q = -q
         with self._lock:
             self._latest_rotvec = rotvec
+            self._latest_quat_wxyz = q.astype(np.float32) 
+            self._latest_pos = np.array([p_x, p_y, p_z], dtype=np.float32)
 
         self._print_cnt += 1
         if self._print_cnt % 50 == 0:
             self.get_logger().info(
                 f"quat(wxyz) = [{w: .4f}, {x: .4f}, {y: .4f}, {z: .4f}] | "
                 f"rotvec = [{rotvec[0]: .3f}, {rotvec[1]: .3f}, {rotvec[2]: .3f}]"
+                f" | pos = [{p_x: .3f}, {p_y: .3f}, {p_z: .3f}]"
             )
     def _push_state_udp(self):
         with self._lock:
             r = self._latest_rotvec.copy()
+            q = self._latest_quat_wxyz.copy()
+            pos = self._latest_pos.copy()
 
-        payload = {"type": "state", "t_us": now_us(), "rotvec": r.tolist()}
+        payload = {"type": "state", "t_us": now_us(), "rotvec": r.tolist(),"quat_wxyz": q.tolist(), "pos": pos.tolist()}
         try:
             self.udp_tx.sendto(json.dumps(payload).encode("utf-8"), self.udp_state_addr)
         except Exception:
@@ -120,7 +139,7 @@ class RosBridge(Node):
             return
 
         a = last.get("a", None)
-        if not (isinstance(a, list) and len(a) == 7):
+        if not (isinstance(a, list) and len(a) == 8):
             self.get_logger().warn("Bad action format")
             return
 

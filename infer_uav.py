@@ -20,9 +20,9 @@ class UdpClient:
         self.action_addr = (udp_ip, action_port)
 
         self._latest_rotvec = np.zeros(3, dtype=np.float32)
+        self._latest_quat_wxyz = np.array([1,0,0,0], dtype=np.float32)
 
-    def get_latest_rotvec(self):
-        # drain buffer, keep newest
+    def _drain_latest_state(self):
         last = None
         while True:
             try:
@@ -35,15 +35,59 @@ class UdpClient:
                     last = obj
             except Exception:
                 continue
-        if last is not None:
-            rv = np.asarray(last["rotvec"], dtype=np.float32).reshape(3)
-            self._latest_rotvec = rv
+
+        if last is None:
+            return
+
+        if "rotvec" in last:
+            self._latest_rotvec = np.asarray(last["rotvec"], dtype=np.float32).reshape(3)
+
+        if "quat_wxyz" in last:
+            q = np.asarray(last["quat_wxyz"], dtype=np.float64).reshape(4)
+            self._latest_quat_wxyz = quat_normalize_wxyz(q).astype(np.float32)
+
+        if "pos" in last:
+            pos = np.asarray(last["pos"], dtype=np.float32).reshape(3)
+            self._latest_pos = pos
+
+    def get_latest_rotvec(self):
+        self._drain_latest_state()
         return self._latest_rotvec.copy()
 
+    def get_latest_quat(self):
+        self._drain_latest_state()
+        return self._latest_quat_wxyz.copy()
+    
+    def get_latest_pos(self):
+        self._drain_latest_state()
+        return self._latest_pos.copy()
+    
     def send_action(self, action7):
-        a = np.asarray(action7, dtype=np.float32).reshape(7).tolist()
+        a = np.asarray(action7, dtype=np.float32).reshape(8).tolist()
         payload = {"type": "action", "t_us": int(time.time() * 1e6), "a": a}
         self.tx.sendto(json.dumps(payload).encode("utf-8"), self.action_addr)
+
+def quat_normalize_wxyz(q):
+    q = np.asarray(q, dtype=np.float64).reshape(4)
+    n = np.linalg.norm(q)
+    if n < 1e-12:
+        q = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+    else:
+        q = q / n
+    if q[0] < 0:
+        q = -q
+    return q
+
+def quat_mul_wxyz(q1, q2):
+    # Hamilton product: q = q1 ⊗ q2, both wxyz
+    w1,x1,y1,z1 = q1
+    w2,x2,y2,z2 = q2
+    return np.array([
+        w1*w2 - x1*x2 - y1*y2 - z1*z2,
+        w1*x2 + x1*w2 + y1*z2 - z1*y2,
+        w1*y2 - x1*z2 + y1*w2 + z1*x2,
+        w1*z2 + x1*y2 - y1*x2 + z1*w2
+    ], dtype=np.float64)
 
 class UAVEnv:
     def __init__(self):
@@ -59,6 +103,10 @@ class UAVEnv:
     def get_motion_capture(self):
         print("Getting motion capture data via UDP...")
         return self.udp_client.get_latest_rotvec()
+    
+    def get_motion_capture_quat(self):
+        print("Getting motion capture quaternion via UDP...")
+        return self.udp_client.get_latest_quat()
     
     def visualize_obs(self, obs):
         img = obs["camera_0"][-1, :, :, ::-1].copy()
@@ -132,18 +180,39 @@ def main(ckpt, device,k):
         for action in action_seq_list:
             action = np.array(action, dtype=np.float64)
             p8 = np.zeros(8, dtype=np.float64)
-            p8[:3] = action[:3]
+
+            # dx,dy,dz = action[:3]
+            dx,dy,dz = [0.,0.,0.]  # 位置增量由视觉伺服控制
+            pos_cur = env.udp_client.get_latest_pos()
+            # import pdb; pdb.set_trace()
+            pos_still = np.array([ 2.7629836 , -0.61798394,  0.980616  ], dtype=np.float32)
+            # import pdb; pdb.set_trace()
+            # p8[0:3] = pos_cur + np.array([dx,dy,dz], dtype=np.float64)
+            p8[0:3] = pos_still + np.array([dx,dy,dz], dtype=np.float64)
             drot = action[3:6]
-            dq_xyzw = R.from_rotvec(drot).as_quat() 
-            dq_xyzw = dq_xyzw / (np.linalg.norm(dq_xyzw) + 1e-12)
-            dq_wxyz = np.array([dq_xyzw[3], dq_xyzw[0], dq_xyzw[1], dq_xyzw[2]])
-            p8[3:7] = dq_wxyz
+
+            # 每个增量都是以当前最新姿态为基础进行增量旋转计算，而不是以推理时间点的姿态为基础（需要验证是否可行）
+            # 1) 当前绝对姿态（wxyz）
+            q_cur = quat_normalize_wxyz(env.udp_client.get_latest_quat())
+            # import pdb; pdb.set_trace()
+            q_still = np.array([0.99991416, 0.00665369, 0.00167531, 0.01116195],dtype=np.float64)
+            # 2) 增量旋转 dq（wxyz）
+            dq_xyzw = R.from_rotvec(drot).as_quat()  # xyzw
+            dq_wxyz = np.array([dq_xyzw[3], dq_xyzw[0], dq_xyzw[1], dq_xyzw[2]], dtype=np.float64)
+            dq_wxyz = quat_normalize_wxyz(dq_wxyz)
+
+            # 3) 合成绝对四元数：q_abs = dq ⊗ q_cur
+            q_abs = quat_mul_wxyz(dq_wxyz, q_cur)
+            q_abs = quat_normalize_wxyz(q_abs)
+
+            # p8[3:7] = q_abs.astype(np.float64)
+            p8[3:7] = q_still.astype(np.float64)
             p8[7] = action[6]
             t_cycle_end = time.time() + dt
             env.publish_action(p8)
             g = 1 if action[6] > 0.5 else 0
             if g != env._last_grip:
-                control_open_state(g)
+                # control_open_state(g)
                 env._last_grip = g
             sleep_time = t_cycle_end - time.time()
             if sleep_time > 0:
